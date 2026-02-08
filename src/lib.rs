@@ -69,11 +69,10 @@ impl<DB: Database> Dispatch<DB> for Thievery<'_, DB> {
 
 trait Query<DB: Database>
 where
-    Self: Clone + Eq + Hash,
+    Self: Clone + Eq + Hash + Into<DB::Query>,
 {
     type Result: Clone;
 
-    fn inject(self) -> DB::Query;
     fn rule(qc: &Context<DB>, query: &Self) -> Self::Result;
     fn sub_map(db: &DB) -> &FxDashMap<Self, Entry<Self::Result, DB::Query>>;
 }
@@ -117,7 +116,7 @@ impl<DB: Database> Context<DB> {
     fn rule<Q: Query<DB>>(&self, query: &Q) -> (Q::Result, Vec<DB::Query>) {
         let mut saved_dependencies = self.query_dependencies.take();
         let result = Q::rule(self, query);
-        saved_dependencies.push(query.clone().inject());
+        saved_dependencies.push(query.clone().into());
         let query_dependencies = self.query_dependencies.replace(saved_dependencies);
         (result, query_dependencies)
     }

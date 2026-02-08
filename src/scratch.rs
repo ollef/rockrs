@@ -1,9 +1,10 @@
 use crate::{Context, Database, Dispatch, Entry, FxDashMap, Query};
+use derive_more::From;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct TypeOf(String);
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, From)]
 enum MyQueries {
     TypeOf(TypeOf),
 }
@@ -27,10 +28,6 @@ impl Database for MyDatabase {
 
 impl Query<MyDatabase> for TypeOf {
     type Result = String;
-
-    fn inject(self) -> MyQueries {
-        MyQueries::TypeOf(self)
-    }
 
     fn rule(_: &Context<MyDatabase>, query: &TypeOf) -> Self::Result {
         format!("Type of term: {}", query.0)
