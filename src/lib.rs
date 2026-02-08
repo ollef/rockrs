@@ -140,9 +140,6 @@ impl<DB: Database> Context<DB> {
                     waiters
                         .borrow_mut()
                         .push((std::thread::current().id(), unparker.clone()));
-                    self.thieves
-                        .borrow_mut()
-                        .push_back((std::thread::current().id(), unparker.clone()));
                     self.deadlock_check(*thread_id);
                     return TryFetch::WaitFor(parker);
                 }
@@ -189,7 +186,15 @@ impl<DB: Database> Context<DB> {
         loop {
             match self.try_fetch(query.clone()) {
                 TryFetch::Stole(stealable) => self.steal(stealable),
-                TryFetch::WaitFor(parker) => parker.park(),
+                TryFetch::WaitFor(parker) => {
+                    self.thieves
+                        .borrow_mut()
+                        .push_back((std::thread::current().id(), parker.unparker().clone()));
+                    parker.park();
+                    self.thieves
+                        .borrow_mut()
+                        .retain(|(tid, _)| *tid != std::thread::current().id());
+                }
                 TryFetch::Complete(result) => return result,
             }
         }
