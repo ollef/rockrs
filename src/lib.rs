@@ -30,11 +30,11 @@ struct Stealable<Q> {
     query: Q,
 }
 
-struct Thievery<'a, DB: Database> {
+struct Theft<'a, DB: Database> {
     context: &'a Context<DB>,
 }
 
-impl<DB: Database> Dispatch<DB> for Thievery<'_, DB> {
+impl<DB: Database> Dispatch<DB> for Theft<'_, DB> {
     type Result = ();
 
     fn dispatch<Q: Query<DB>>(self, query: Q) -> Self::Result {
@@ -122,7 +122,7 @@ impl<DB: Database> Context<DB> {
     }
 
     fn steal(&self, stealable: Stealable<DB::Query>) {
-        DB::dispatch(Thievery { context: self }, stealable.query);
+        DB::dispatch(Theft { context: self }, stealable.query);
     }
 
     fn try_fetch<Q: Query<DB>>(&self, query: Q) -> TryFetch<Q::Result, DB::Query> {
