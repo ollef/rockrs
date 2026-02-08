@@ -1,13 +1,21 @@
-use crossbeam::sync::Unparker;
+mod scratch;
+
+use crossbeam::sync::{Parker, Unparker};
 use dashmap::DashMap;
 use fxhash::FxBuildHasher;
-use std::{cell::RefCell, collections::VecDeque, hash::Hash, rc::Rc, sync::Once, thread::ThreadId};
-mod scratch;
+use std::{cell::RefCell, collections::VecDeque, hash::Hash, rc::Rc, thread::ThreadId};
 
 type FxDashMap<K, V> = DashMap<K, V, FxBuildHasher>;
 
-trait Database {
-    type Query: Clone + Eq;
+trait Database
+where
+    Self: Sized,
+{
+    type Query: Clone + Eq + std::fmt::Debug;
+
+    fn dispatch<D>(d: D, q: Self::Query) -> D::Result
+    where
+        D: Dispatch<Self>;
 }
 
 struct QueryContext<DB: Database> {
@@ -15,48 +23,10 @@ struct QueryContext<DB: Database> {
     dependencies: RefCell<Vec<DB::Query>>,
 }
 
-struct Waiters {
-    storage: RefCell<VecDeque<(ThreadId, Unparker)>>,
-}
-
-impl Waiters {
-    fn new() -> Self {
-        Self {
-            storage: RefCell::new(VecDeque::new()),
-        }
-    }
-
-    fn add(&self, unparker: Unparker) {
-        let tid = std::thread::current().id();
-        self.storage.borrow_mut().push_back((tid, unparker));
-    }
-
-    fn remove(&self) -> Option<Unparker> {
-        let tid = std::thread::current().id();
-        let mut storage = self.storage.borrow_mut();
-        storage
-            .iter()
-            .position(|(t, _)| *t == tid)
-            .map(|pos| storage.remove(pos).unwrap().1)
-    }
-
-    fn unpark_all(&self) {
-        let mut storage = self.storage.borrow_mut();
-        for (_, unparker) in storage.drain(..) {
-            unparker.unpark();
-        }
-    }
-
-    fn unpark_one(&self) {
-        if let Some((_, unparker)) = self.storage.borrow_mut().pop_front() {
-            unparker.unpark();
-        }
-    }
-}
-
 struct Context<DB: Database> {
     query: QueryContext<DB>,
     stealable: RefCell<Vec<Stealable<DB::Query>>>,
+    thieves: RefCell<VecDeque<(ThreadId, Unparker)>>,
     database: DB,
     thread_dependencies: DashMap<ThreadId, ThreadId>,
 }
@@ -66,78 +36,88 @@ struct Stealable<Q> {
     stack: Vec<Q>,
 }
 
+struct Thievery<'a, DB: Database> {
+    context: &'a Context<DB>,
+}
+
+impl<DB: Database> Dispatch<DB> for Thievery<'_, DB> {
+    type Result = ();
+
+    fn dispatch<Q: Query<DB>>(self, query: Q) -> Self::Result {
+        let map = Q::sub_map(&self.context.database);
+        let waiters = match map.entry(query.clone()) {
+            dashmap::Entry::Occupied(_) => return,
+            dashmap::Entry::Vacant(vacant_entry) => {
+                let waiters = Rc::new(RefCell::new(Vec::new()));
+                let tid = std::thread::current().id();
+                vacant_entry.insert(Entry::InProgress {
+                    thread_id: tid,
+                    waiters: waiters.clone(),
+                });
+                waiters
+            }
+        };
+
+        let (result, dependencies) = self.context.rule(&query);
+        map.insert(
+            query,
+            Entry::Complete {
+                result,
+                dependencies,
+            },
+        );
+        for (waiting_thread_id, waiter) in waiters.borrow().iter() {
+            self.context.thread_dependencies.remove(waiting_thread_id);
+            waiter.unpark();
+        }
+    }
+}
+
 trait Query<DB: Database>
 where
-    Self: Clone,
+    Self: Clone + Eq + Hash,
 {
     type Result: Clone;
 
     fn inject(self) -> DB::Query;
     fn rule(qc: &Context<DB>, query: &Self) -> Self::Result;
-    fn try_fetch(qc: &Context<DB>, query: Self) -> EntryStatus<Self::Result>;
+    fn sub_map(db: &DB) -> &FxDashMap<Self, Entry<Self::Result, DB::Query>>;
 }
 
-trait Queries<DB: Database>
-where
-    Self: Clone + std::fmt::Debug,
-{
-    fn try_fetch(qc: &Context<DB>, query: Self) -> EntryStatus<()>;
+trait Dispatch<DB: Database> {
+    type Result;
+    fn dispatch<Q: Query<DB>>(self, query: Q) -> Self::Result;
 }
 
 #[derive(Clone)]
-pub enum EntryStatus<Result> {
-    InProgress(ThreadId, Rc<Once>),
+pub enum Entry<Result, Query> {
+    InProgress {
+        thread_id: ThreadId,
+        waiters: Rc<RefCell<Vec<(ThreadId, Unparker)>>>,
+    },
+    Complete {
+        result: Result,
+        dependencies: Vec<Query>,
+    },
+}
+
+enum TryFetch<Result, Query> {
+    Stole(Stealable<Query>),
+    WaitFor(Parker),
     Complete(Result),
 }
 
-impl<T> EntryStatus<T> {
-    pub fn map<S>(self, f: impl FnOnce(T) -> S) -> EntryStatus<S> {
-        match self {
-            EntryStatus::InProgress(tid, once) => EntryStatus::InProgress(tid, once),
-            EntryStatus::Complete(result) => EntryStatus::Complete(f(result)),
-        }
-    }
-
-    pub fn as_ref(&self) -> EntryStatus<&T> {
-        match self {
-            EntryStatus::InProgress(tid, once) => EntryStatus::InProgress(*tid, once.clone()),
-            EntryStatus::Complete(result) => EntryStatus::Complete(result),
-        }
-    }
-}
-
-impl<DB: Database> Context<DB>
-where
-    DB::Query: Queries<DB>,
-{
-    fn try_fetch_dash_map<Q: Query<DB> + Eq + Hash>(
-        &self,
-        query: Q,
-        map: &FxDashMap<Q, EntryStatus<(Q::Result, Vec<DB::Query>)>>,
-    ) -> EntryStatus<Q::Result> {
-        let once = match map.entry(query.clone()) {
-            dashmap::Entry::Occupied(occupied_entry) => {
-                return occupied_entry
-                    .get()
-                    .as_ref()
-                    .map(|(result, _)| result.clone());
+impl<DB: Database> Context<DB> {
+    fn deadlock_check(&self, other_tid: ThreadId) {
+        let my_tid = std::thread::current().id();
+        self.thread_dependencies.insert(my_tid, other_tid);
+        let mut current = other_tid;
+        while let Some(next) = self.thread_dependencies.get(&current).map(|entry| *entry) {
+            if next == my_tid {
+                panic!("cyclic query detected");
             }
-            dashmap::Entry::Vacant(vacant_entry) => {
-                let once = Rc::new(Once::new());
-                let tid = std::thread::current().id();
-                vacant_entry.insert(EntryStatus::InProgress(tid, once.clone()));
-                once
-            }
-        };
-
-        let (result, dependencies) = self.rule(&query);
-        map.insert(query, EntryStatus::Complete((result.clone(), dependencies)));
-        let mut called = false;
-        once.call_once(|| {
-            called = true;
-        });
-        assert!(called);
-        EntryStatus::Complete(result)
+            current = next;
+        }
     }
 
     fn rule<Q: Query<DB>>(&self, query: &Q) -> (Q::Result, Vec<DB::Query>) {
@@ -156,28 +136,70 @@ where
         (result, query_dependencies)
     }
 
-    fn wait(&self, other_tid: ThreadId, once: &Once) {
-        while let Some(stealable) = self.stealable.borrow_mut().pop() {
-            self.steal(stealable)
-        }
-        // TODO: We should wait for more stealable data _or_ the once.
-        once.wait();
-    }
-
     fn steal(&self, mut stealable: Stealable<DB::Query>) {
         std::mem::swap(self.query.stack.borrow_mut().as_mut(), &mut stealable.stack);
-        match DB::Query::try_fetch(self, stealable.query) {
-            EntryStatus::InProgress(..) => {}
-            EntryStatus::Complete(()) => {}
-        }
+        DB::dispatch(Thievery { context: self }, stealable.query);
         std::mem::swap(self.query.stack.borrow_mut().as_mut(), &mut stealable.stack);
+    }
+
+    fn try_fetch<Q: Query<DB>>(&self, query: Q) -> TryFetch<Q::Result, DB::Query> {
+        let map = Q::sub_map(&self.database);
+        let waiters = match map.entry(query.clone()) {
+            dashmap::Entry::Occupied(mut occupied_entry) => match occupied_entry.get() {
+                Entry::InProgress { .. } => {
+                    let Entry::InProgress { thread_id, waiters } = occupied_entry.get_mut() else {
+                        unreachable!()
+                    };
+                    if let Some(stealable) = self.stealable.borrow_mut().pop() {
+                        return TryFetch::Stole(stealable);
+                    }
+                    let parker = Parker::new();
+                    let unparker = parker.unparker();
+                    waiters
+                        .borrow_mut()
+                        .push((std::thread::current().id(), unparker.clone()));
+                    self.thieves
+                        .borrow_mut()
+                        .push_back((std::thread::current().id(), unparker.clone()));
+                    self.deadlock_check(*thread_id);
+                    return TryFetch::WaitFor(parker);
+                }
+                Entry::Complete { result, .. } => {
+                    return TryFetch::Complete(result.clone());
+                }
+            },
+            dashmap::Entry::Vacant(vacant_entry) => {
+                let waiters = Rc::new(RefCell::new(Vec::new()));
+                let tid = std::thread::current().id();
+                vacant_entry.insert(Entry::InProgress {
+                    thread_id: tid,
+                    waiters: waiters.clone(),
+                });
+                waiters
+            }
+        };
+
+        let (result, dependencies) = self.rule(&query);
+        map.insert(
+            query,
+            Entry::Complete {
+                result: result.clone(),
+                dependencies,
+            },
+        );
+        for (waiting_thread_id, waiter) in waiters.borrow().iter() {
+            self.thread_dependencies.remove(waiting_thread_id);
+            waiter.unpark();
+        }
+        TryFetch::Complete(result)
     }
 
     pub fn fetch<Q: Query<DB>>(&self, query: &Q) -> Q::Result {
         loop {
-            match Q::try_fetch(self, query.clone()) {
-                EntryStatus::InProgress(tid, once) => self.wait(tid, &once),
-                EntryStatus::Complete(result) => return result,
+            match self.try_fetch(query.clone()) {
+                TryFetch::Stole(stealable) => self.steal(stealable),
+                TryFetch::WaitFor(parker) => parker.park(),
+                TryFetch::Complete(result) => return result,
             }
         }
     }

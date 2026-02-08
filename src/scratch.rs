@@ -1,4 +1,4 @@
-use crate::{Context, Database, EntryStatus, FxDashMap, Queries, Query};
+use crate::{Context, Database, Dispatch, Entry, FxDashMap, Query};
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct TypeOf(String);
@@ -9,17 +9,18 @@ enum MyQueries {
 }
 
 struct MyDatabase {
-    type_of: FxDashMap<TypeOf, EntryStatus<(String, Vec<MyQueries>)>>,
+    type_of: FxDashMap<TypeOf, Entry<String, MyQueries>>,
 }
 
 impl Database for MyDatabase {
     type Query = MyQueries;
-}
 
-impl Queries<MyDatabase> for MyQueries {
-    fn try_fetch(qc: &Context<MyDatabase>, query: MyQueries) -> EntryStatus<()> {
-        match query {
-            MyQueries::TypeOf(q) => TypeOf::try_fetch(qc, q).map(|_| ()),
+    fn dispatch<D>(d: D, q: Self::Query) -> D::Result
+    where
+        D: Dispatch<Self>,
+    {
+        match q {
+            MyQueries::TypeOf(type_of) => d.dispatch(type_of),
         }
     }
 }
@@ -35,7 +36,7 @@ impl Query<MyDatabase> for TypeOf {
         format!("Type of term: {}", query.0)
     }
 
-    fn try_fetch(qc: &Context<MyDatabase>, query: TypeOf) -> EntryStatus<String> {
-        qc.try_fetch_dash_map(query, &qc.database.type_of)
+    fn sub_map(db: &MyDatabase) -> &FxDashMap<TypeOf, Entry<Self::Result, MyQueries>> {
+        &db.type_of
     }
 }
