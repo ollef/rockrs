@@ -33,7 +33,7 @@ impl Query<MyDatabase> for TypeOf {
         format!("Type of term: {}", query.0)
     }
 
-    fn sub_map(db: &MyDatabase) -> &FxDashMap<TypeOf, Entry<Self::Result, MyQueries>> {
+    fn storage(db: &MyDatabase) -> &FxDashMap<TypeOf, Entry<Self::Result, MyQueries>> {
         &db.type_of
     }
 }

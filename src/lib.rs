@@ -38,7 +38,7 @@ impl<DB: Database> Dispatch<DB> for Thievery<'_, DB> {
     type Result = ();
 
     fn dispatch<Q: Query<DB>>(self, query: Q) -> Self::Result {
-        let map = Q::sub_map(&self.context.database);
+        let map = Q::storage(&self.context.database);
         let waiters = match map.entry(query.clone()) {
             dashmap::Entry::Occupied(_) => return,
             dashmap::Entry::Vacant(vacant_entry) => {
@@ -73,8 +73,8 @@ where
 {
     type Result: Clone;
 
+    fn storage(db: &DB) -> &FxDashMap<Self, Entry<Self::Result, DB::Query>>;
     fn rule(qc: &Context<DB>, query: &Self) -> Self::Result;
-    fn sub_map(db: &DB) -> &FxDashMap<Self, Entry<Self::Result, DB::Query>>;
 }
 
 trait Dispatch<DB: Database> {
@@ -126,7 +126,7 @@ impl<DB: Database> Context<DB> {
     }
 
     fn try_fetch<Q: Query<DB>>(&self, query: Q) -> TryFetch<Q::Result, DB::Query> {
-        let map = Q::sub_map(&self.database);
+        let map = Q::storage(&self.database);
         let waiters = match map.entry(query.clone()) {
             dashmap::Entry::Occupied(mut occupied_entry) => match occupied_entry.get() {
                 Entry::InProgress { .. } => {
