@@ -114,9 +114,8 @@ impl<DB: Database> Context<DB> {
     }
 
     fn rule<Q: Query<DB>>(&self, query: &Q) -> (Q::Result, Vec<DB::Query>) {
-        let mut saved_dependencies = self.query_dependencies.take();
+        let saved_dependencies = self.query_dependencies.take();
         let result = Q::rule(self, query);
-        saved_dependencies.push(query.clone().into());
         let query_dependencies = self.query_dependencies.replace(saved_dependencies);
         (result, query_dependencies)
     }
@@ -178,6 +177,15 @@ impl<DB: Database> Context<DB> {
     }
 
     pub fn fetch<Q: Query<DB>>(&self, query: &Q) -> Q::Result {
+        if !self
+            .query_dependencies
+            .borrow()
+            .contains(&query.clone().into())
+        {
+            self.query_dependencies
+                .borrow_mut()
+                .push(query.clone().into());
+        }
         loop {
             match self.try_fetch(query.clone()) {
                 TryFetch::Stole(stealable) => self.steal(stealable),
