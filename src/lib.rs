@@ -18,13 +18,8 @@ where
         D: Dispatch<Self>;
 }
 
-struct QueryContext<DB: Database> {
-    stack: RefCell<Vec<DB::Query>>,
-    dependencies: RefCell<Vec<DB::Query>>,
-}
-
 struct Context<DB: Database> {
-    query: QueryContext<DB>,
+    query_dependencies: RefCell<Vec<DB::Query>>,
     stealable: RefCell<Vec<Stealable<DB::Query>>>,
     thieves: RefCell<VecDeque<(ThreadId, Unparker)>>,
     database: DB,
@@ -33,7 +28,6 @@ struct Context<DB: Database> {
 
 struct Stealable<Q> {
     query: Q,
-    stack: Vec<Q>,
 }
 
 struct Thievery<'a, DB: Database> {
@@ -121,25 +115,15 @@ impl<DB: Database> Context<DB> {
     }
 
     fn rule<Q: Query<DB>>(&self, query: &Q) -> (Q::Result, Vec<DB::Query>) {
-        let injected_query = query.clone().inject();
-
-        if self.query.stack.borrow().contains(&injected_query) {
-            panic!("cyclic query detected: {:?}", self.query.stack.borrow());
-        }
-
-        let saved_dependencies = self.query.dependencies.take();
-
-        self.query.stack.borrow_mut().push(injected_query);
+        let mut saved_dependencies = self.query_dependencies.take();
         let result = Q::rule(self, query);
-        self.query.stack.borrow_mut().pop();
-        let query_dependencies = self.query.dependencies.replace(saved_dependencies);
+        saved_dependencies.push(query.clone().inject());
+        let query_dependencies = self.query_dependencies.replace(saved_dependencies);
         (result, query_dependencies)
     }
 
-    fn steal(&self, mut stealable: Stealable<DB::Query>) {
-        std::mem::swap(self.query.stack.borrow_mut().as_mut(), &mut stealable.stack);
+    fn steal(&self, stealable: Stealable<DB::Query>) {
         DB::dispatch(Thievery { context: self }, stealable.query);
-        std::mem::swap(self.query.stack.borrow_mut().as_mut(), &mut stealable.stack);
     }
 
     fn try_fetch<Q: Query<DB>>(&self, query: Q) -> TryFetch<Q::Result, DB::Query> {
