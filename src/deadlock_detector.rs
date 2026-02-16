@@ -1,0 +1,71 @@
+use crate::WorkerId;
+use bitvec::vec::BitVec;
+use std::sync::Mutex;
+
+pub struct DeadlockDetector {
+    state: Mutex<State>,
+}
+
+struct State {
+    waits_for: BitVec,
+    todo: BitVec,
+    not_visited: BitVec,
+}
+
+impl DeadlockDetector {
+    pub fn new(num_workers: usize) -> Self {
+        Self {
+            state: Mutex::new(State {
+                waits_for: BitVec::repeat(false, num_workers * num_workers),
+                todo: BitVec::repeat(false, num_workers),
+                not_visited: BitVec::repeat(false, num_workers),
+            }),
+        }
+    }
+
+    pub fn add_wait(&self, me: WorkerId, other: WorkerId) -> Result<(), ()> {
+        if me == other {
+            return Err(());
+        }
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
+        state.todo.fill(false);
+        state.not_visited.fill(true);
+        let num_workers = state.num_workers();
+
+        state.todo.set(other.0, true);
+
+        while let Some(current) = state.todo.first_one() {
+            if current == me.0 {
+                // Cycle detected.
+                return Err(());
+            }
+
+            state.todo.set(current, false);
+            state.not_visited.set(current, false);
+
+            let neighbors = state
+                .waits_for
+                .get(current * num_workers..(current + 1) * num_workers)
+                .unwrap();
+
+            state.todo |= neighbors;
+            state.todo &= &state.not_visited;
+        }
+
+        state.waits_for.set(me.0 * num_workers + other.0, true);
+        Ok(())
+    }
+
+    pub fn remove_wait(&self, me: WorkerId, other: WorkerId) {
+        let mut state = self.state.lock().unwrap();
+        let num_workers = state.num_workers();
+        state.waits_for.set(me.0 * num_workers + other.0, false);
+    }
+}
+
+impl State {
+    fn num_workers(&self) -> usize {
+        self.not_visited.len()
+    }
+}
