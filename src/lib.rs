@@ -1,7 +1,7 @@
 mod deadlock_detector;
 mod scratch;
 
-use crossbeam::deque::{self, Injector, Stealer};
+use crossbeam::deque::{self, Injector, Steal, Stealer};
 use dashmap::DashMap;
 use deadlock_detector::DeadlockDetector;
 use event_listener::{Event, Listener, listener};
@@ -301,9 +301,9 @@ impl<DB: Database> Context<DB> {
         self.stealable.pop().or_else(|| {
             loop {
                 match self.global.injector.steal_batch_and_pop(&self.stealable) {
-                    crossbeam::deque::Steal::Success(query) => return Some(query),
-                    crossbeam::deque::Steal::Empty => break,
-                    crossbeam::deque::Steal::Retry => continue,
+                    Steal::Success(query) => return Some(query),
+                    Steal::Empty => break,
+                    Steal::Retry => continue,
                 }
             }
 
@@ -313,9 +313,9 @@ impl<DB: Database> Context<DB> {
             {
                 loop {
                     match worker.stealer.steal_batch_and_pop(&self.stealable) {
-                        crossbeam::deque::Steal::Success(query) => return Some(query),
-                        crossbeam::deque::Steal::Empty => break,
-                        crossbeam::deque::Steal::Retry => continue,
+                        Steal::Success(query) => return Some(query),
+                        Steal::Empty => break,
+                        Steal::Retry => continue,
                     }
                 }
             }
