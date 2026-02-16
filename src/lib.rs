@@ -193,18 +193,7 @@ impl<DB: Database> Context<DB> {
                 event: Arc::new(Event::new()),
             });
             self.stealable.push(query.clone().into());
-
-            for worker in &self.global.workers {
-                if let Some(thread) = worker.thread.get()
-                    && worker
-                        .is_idle
-                        .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
-                        .is_ok()
-                {
-                    thread.unpark();
-                    break;
-                }
-            }
+            self.global.try_wake_idle_thread();
         }
     }
 
@@ -324,6 +313,22 @@ impl<DB: Database> Context<DB> {
     }
 }
 
+impl<DB: Database> GlobalContext<DB> {
+    pub(crate) fn try_wake_idle_thread(&self) {
+        for worker in &self.workers {
+            if let Some(thread) = worker.thread.get()
+                && worker
+                    .is_idle
+                    .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                thread.unpark();
+                break;
+            }
+        }
+    }
+}
+
 struct Engine<DB: Database> {
     global: Arc<GlobalContext<DB>>,
     handles: Vec<JoinHandle<()>>,
@@ -408,16 +413,7 @@ where
                         event: event.clone(),
                     });
                     self.global.injector.push(query.clone().into());
-                    for worker in &self.global.workers {
-                        if worker
-                            .is_idle
-                            .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
-                            .is_ok()
-                        {
-                            worker.thread.wait().unpark();
-                            break;
-                        }
-                    }
+                    self.global.try_wake_idle_thread();
                     listener.wait();
                 }
             }
