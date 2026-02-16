@@ -123,9 +123,14 @@ impl<DB: Database> Context<DB> {
                             panic!("Deadlock detected");
                         }
 
+                        let _guard = deadlock_detector::WaitGuard {
+                            detector: &self.global.deadlock_detector,
+                            me: self.id,
+                            other: worker,
+                        };
+
                         self.wait(listener);
 
-                        self.global.deadlock_detector.remove_wait(self.id, worker);
                         continue;
                     }
                     Entry::Completed { result, .. } => return result.clone(),

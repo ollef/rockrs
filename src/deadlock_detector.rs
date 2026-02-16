@@ -69,3 +69,15 @@ impl State {
         self.not_visited.len()
     }
 }
+
+pub(crate) struct WaitGuard<'a> {
+    pub detector: &'a DeadlockDetector,
+    pub me: WorkerId,
+    pub other: WorkerId,
+}
+
+impl<'a> Drop for WaitGuard<'a> {
+    fn drop(&mut self) {
+        self.detector.remove_wait(self.me, self.other);
+    }
+}
