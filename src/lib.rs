@@ -1,7 +1,7 @@
 mod deadlock_detector;
 mod scratch;
 
-use crossbeam::deque::{self, Stealer};
+use crossbeam::deque::{self, Injector, Stealer};
 use dashmap::DashMap;
 use deadlock_detector::DeadlockDetector;
 use event_listener::{Event, Listener, listener};
@@ -39,6 +39,7 @@ struct GlobalContext<DB: Database> {
     database: DB,
     workers: Vec<Worker<DB>>,
     deadlock_detector: DeadlockDetector,
+    injector: Injector<DB::Query>,
 }
 
 struct Worker<DB: Database> {
@@ -297,6 +298,14 @@ impl<DB: Database> Context<DB> {
 
     fn find_work(&self) -> Option<DB::Query> {
         self.stealable.pop().or_else(|| {
+            loop {
+                match self.global.injector.steal_batch_and_pop(&self.stealable) {
+                    crossbeam::deque::Steal::Success(query) => return Some(query),
+                    crossbeam::deque::Steal::Empty => break,
+                    crossbeam::deque::Steal::Retry => continue,
+                }
+            }
+
             for worker in self.global.workers[self.id.0 + 1..self.global.workers.len()]
                 .iter()
                 .chain(&self.global.workers[0..self.id.0])
