@@ -95,6 +95,24 @@ pub enum Entry<Result, Query> {
         result: Result,
         dependencies: Vec<Query>,
     },
+    Poisoned,
+}
+
+struct InProgressGuard<'a, DB: Database, Q: Query<DB>> {
+    storage: &'a FxDashMap<Q, Entry<Q::Result, DB::Query>>,
+    query: Option<Q>,
+}
+
+impl<'a, DB: Database, Q: Query<DB>> Drop for InProgressGuard<'a, DB, Q> {
+    fn drop(&mut self) {
+        if let Some(query) = self.query.take() {
+            let Some(Entry::InProgress { event, .. }) = self.storage.insert(query, Entry::Poisoned)
+            else {
+                unreachable!();
+            };
+            event.notify(usize::MAX);
+        }
+    }
 }
 
 impl<DB: Database> Context<DB> {
@@ -134,6 +152,10 @@ impl<DB: Database> Context<DB> {
                         continue;
                     }
                     Entry::Completed { result, .. } => return result.clone(),
+                    Entry::Poisoned => {
+                        drop(entry);
+                        panic!("Query panicked during execution")
+                    }
                 },
                 None => {
                     if let Some(result) = self.try_claim_and_execute(query.clone(), Clone::clone) {
@@ -189,7 +211,9 @@ impl<DB: Database> Context<DB> {
                         event: Arc::new(Event::new()),
                     });
                 }
-                Entry::InProgress { .. } | Entry::Completed { .. } => return None,
+                Entry::InProgress { .. } | Entry::Completed { .. } | Entry::Poisoned => {
+                    return None;
+                }
             },
             dashmap::Entry::Vacant(vacant_entry) => {
                 vacant_entry.insert(Entry::InProgress {
@@ -198,9 +222,14 @@ impl<DB: Database> Context<DB> {
                 });
             }
         }
+        let mut panic_guard = InProgressGuard {
+            storage,
+            query: Some(query.clone()),
+        };
         let (query_result, dependencies) =
             stacker::maybe_grow(64 * 1024, 1024 * 1024, || self.rule(&query));
         let result = f(&query_result);
+        panic_guard.query = None;
         let old_entry = storage.insert(
             query,
             Entry::Completed {
