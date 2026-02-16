@@ -5,13 +5,14 @@ use crossbeam::deque::{self, Stealer};
 use dashmap::DashMap;
 use deadlock_detector::DeadlockDetector;
 use event_listener::{Event, Listener, listener};
-use fxhash::FxBuildHasher;
+use fxhash::{FxBuildHasher, FxHashSet};
 use std::{
     cell::RefCell,
+    fmt::Debug,
     hash::Hash,
     pin::pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     task::{Poll, Waker},
@@ -27,7 +28,7 @@ trait Database
 where
     Self: Sized,
 {
-    type Query: Clone + Eq + std::fmt::Debug;
+    type Query: Clone + Eq + Debug + Hash;
 
     fn dispatch<D>(d: D, q: Self::Query) -> D::Result
     where
@@ -51,6 +52,7 @@ struct Context<DB: Database> {
     global: Arc<GlobalContext<DB>>,
     stealable: deque::Worker<DB::Query>,
     waker: Waker,
+    current_query: RefCell<Option<DB::Query>>,
     query_dependencies: RefCell<Vec<DB::Query>>,
 }
 
@@ -94,6 +96,7 @@ pub enum Entry<Result, Query> {
     Completed {
         result: Result,
         dependencies: Vec<Query>,
+        reverse_dependencies: Mutex<FxHashSet<Query>>,
     },
     Poisoned,
 }
@@ -151,7 +154,19 @@ impl<DB: Database> Context<DB> {
 
                         continue;
                     }
-                    Entry::Completed { result, .. } => return result.clone(),
+                    Entry::Completed {
+                        result,
+                        reverse_dependencies,
+                        ..
+                    } => {
+                        if let Some(current_query) = self.current_query.borrow().as_ref() {
+                            reverse_dependencies
+                                .lock()
+                                .unwrap()
+                                .insert(current_query.clone());
+                        }
+                        return result.clone();
+                    }
                     Entry::Poisoned => {
                         drop(entry);
                         panic!("Query panicked during execution")
@@ -192,8 +207,10 @@ impl<DB: Database> Context<DB> {
 
     fn rule<Q: Query<DB>>(&self, query: &Q) -> (Q::Result, Vec<DB::Query>) {
         let saved_dependencies = self.query_dependencies.take();
+        let saved_current_query = self.current_query.replace(Some(query.clone().into()));
         let result = Q::rule(self, query);
         let query_dependencies = self.query_dependencies.replace(saved_dependencies);
+        self.current_query.replace(saved_current_query);
         (result, query_dependencies)
     }
 
@@ -230,11 +247,16 @@ impl<DB: Database> Context<DB> {
             stacker::maybe_grow(64 * 1024, 1024 * 1024, || self.rule(&query));
         let result = f(&query_result);
         panic_guard.query = None;
+        let mut reverse_dependencies = FxHashSet::default();
+        if let Some(current_query) = self.current_query.borrow().as_ref() {
+            reverse_dependencies.insert(current_query.clone());
+        }
         let old_entry = storage.insert(
             query,
             Entry::Completed {
                 result: query_result,
                 dependencies,
+                reverse_dependencies: Mutex::new(reverse_dependencies),
             },
         );
         let event = match old_entry {

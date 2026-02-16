@@ -4,7 +4,7 @@ use derive_more::From;
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct TypeOf(String);
 
-#[derive(Clone, PartialEq, Eq, Debug, From)]
+#[derive(Clone, PartialEq, Eq, Debug, From, Hash)]
 enum MyQueries {
     TypeOf(TypeOf),
 }
