@@ -12,11 +12,11 @@ use std::{
     hash::Hash,
     pin::pin,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     task::{Poll, Waker},
-    thread::Thread,
+    thread::{JoinHandle, Thread},
 };
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -40,10 +40,11 @@ struct GlobalContext<DB: Database> {
     workers: Vec<Worker<DB>>,
     deadlock_detector: DeadlockDetector,
     injector: Injector<DB::Query>,
+    shutdown: AtomicBool,
 }
 
 struct Worker<DB: Database> {
-    thread: Thread,
+    thread: OnceLock<Thread>,
     is_idle: AtomicBool,
     stealer: Stealer<DB::Query>,
 }
@@ -194,12 +195,13 @@ impl<DB: Database> Context<DB> {
             self.stealable.push(query.clone().into());
 
             for worker in &self.global.workers {
-                if worker
-                    .is_idle
-                    .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
+                if let Some(thread) = worker.thread.get()
+                    && worker
+                        .is_idle
+                        .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
                 {
-                    worker.thread.unpark();
+                    thread.unpark();
                     break;
                 }
             }
@@ -320,5 +322,118 @@ impl<DB: Database> Context<DB> {
             }
             None
         })
+    }
+}
+
+struct Engine<DB: Database> {
+    global: Arc<GlobalContext<DB>>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl<DB: Database + Send + Sync + 'static> Engine<DB>
+where
+    DB::Query: Send,
+{
+    pub fn new(database: DB, num_workers: usize) -> Self {
+        let global = Arc::new(GlobalContext {
+            database,
+            workers: Vec::from_iter((0..num_workers).map(|_| Worker {
+                thread: OnceLock::new(),
+                is_idle: AtomicBool::new(true),
+                stealer: deque::Worker::new_fifo().stealer(),
+            })),
+            deadlock_detector: DeadlockDetector::new(num_workers),
+            injector: Injector::new(),
+            shutdown: AtomicBool::new(false),
+        });
+
+        let handles = (0..num_workers)
+            .map(|id| {
+                let global = global.clone();
+                std::thread::spawn(move || {
+                    let thread = std::thread::current();
+                    global.workers[id].thread.set(thread.clone()).unwrap();
+                    let context = Context {
+                        id: WorkerId(id),
+                        global,
+                        stealable: deque::Worker::new_fifo(),
+                        waker: waker_fn::waker_fn(move || {
+                            thread.unpark();
+                        }),
+                        current_query: RefCell::new(None),
+                        query_dependencies: RefCell::new(Vec::new()),
+                    };
+
+                    loop {
+                        if context.global.shutdown.load(Ordering::Acquire) {
+                            break;
+                        }
+
+                        if let Some(query) = context.find_work() {
+                            DB::dispatch(Theft { context: &context }, query);
+                            continue;
+                        }
+
+                        context.global.workers[id]
+                            .is_idle
+                            .store(true, Ordering::Release);
+                        std::thread::park();
+                        context.global.workers[id]
+                            .is_idle
+                            .store(false, Ordering::Release);
+                    }
+                })
+            })
+            .collect();
+
+        Self { global, handles }
+    }
+
+    pub fn fetch<Q: Query<DB>>(&self, query: &Q) -> Q::Result {
+        let storage = Q::storage(&self.global.database);
+
+        loop {
+            match storage.entry(query.clone()) {
+                dashmap::Entry::Occupied(entry) => match entry.get() {
+                    Entry::Completed { result, .. } => return result.clone(),
+                    Entry::Poisoned => panic!("Query panicked during execution"),
+                    Entry::InProgress { event, .. } | Entry::Queued { event } => {
+                        listener!(event => listener);
+                        listener.wait();
+                    }
+                },
+                dashmap::Entry::Vacant(entry) => {
+                    let event = Arc::new(Event::new());
+                    listener!(event => listener);
+                    entry.insert(Entry::Queued {
+                        event: event.clone(),
+                    });
+                    self.global.injector.push(query.clone().into());
+                    for worker in &self.global.workers {
+                        if worker
+                            .is_idle
+                            .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            worker.thread.wait().unpark();
+                            break;
+                        }
+                    }
+                    listener.wait();
+                }
+            }
+        }
+    }
+}
+
+impl<DB: Database> Drop for Engine<DB> {
+    fn drop(&mut self) {
+        self.global.shutdown.store(true, Ordering::Release);
+        for worker in &self.global.workers {
+            worker.thread.wait().unpark();
+        }
+        for handle in self.handles.drain(..) {
+            handle.join().unwrap();
+        }
     }
 }

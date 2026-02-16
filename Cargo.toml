@@ -11,3 +11,4 @@ derive_more = { version = "2.1.1", features = ["from"] }
 event-listener = "5.4.1"
 fxhash = "0.2.1"
 stacker = "0.1.23"
+waker-fn = "1.2.0"
