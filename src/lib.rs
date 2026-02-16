@@ -58,11 +58,11 @@ struct Context<DB: Database> {
     query_dependencies: RefCell<Vec<DB::Query>>,
 }
 
-struct Theft<'a, DB: Database> {
+struct TryClaimAndExecute<'a, DB: Database> {
     context: &'a Context<DB>,
 }
 
-impl<DB: Database> Dispatch<DB> for Theft<'_, DB> {
+impl<DB: Database> Dispatch<DB> for TryClaimAndExecute<'_, DB> {
     type Result = ();
 
     fn dispatch<Q: Query<DB>>(self, query: Q) -> Self::Result {
@@ -272,7 +272,7 @@ impl<DB: Database> Context<DB> {
             }
 
             if let Some(query) = self.find_work() {
-                DB::dispatch(Theft { context: self }, query);
+                DB::dispatch(TryClaimAndExecute { context: self }, query);
                 continue;
             }
 
@@ -374,7 +374,7 @@ where
                         }
 
                         if let Some(query) = context.find_work() {
-                            DB::dispatch(Theft { context: &context }, query);
+                            DB::dispatch(TryClaimAndExecute { context: &context }, query);
                             continue;
                         }
 
