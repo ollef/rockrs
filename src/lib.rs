@@ -84,7 +84,9 @@ trait Dispatch<DB: Database> {
 }
 
 pub enum Entry<Result, Query> {
-    Queued,
+    Queued {
+        event: Arc<Event>,
+    },
     InProgress {
         worker: WorkerId,
         event: Arc<Event>,
@@ -123,7 +125,7 @@ impl<DB: Database> Context<DB> {
         loop {
             match storage.get(query) {
                 Some(entry) => match entry.value() {
-                    Entry::Queued => {
+                    Entry::Queued { .. } => {
                         drop(entry);
                         if let Some(result) =
                             self.try_claim_and_execute(query.clone(), Clone::clone)
@@ -185,7 +187,9 @@ impl<DB: Database> Context<DB> {
         if let dashmap::Entry::Vacant(entry) =
             Q::storage(&self.global.database).entry(query.clone())
         {
-            entry.insert(Entry::Queued);
+            entry.insert(Entry::Queued {
+                event: Arc::new(Event::new()),
+            });
             self.stealable.push(query.clone().into());
 
             for worker in &self.global.workers {
@@ -218,10 +222,15 @@ impl<DB: Database> Context<DB> {
         let storage = Q::storage(&self.global.database);
         match storage.entry(query.clone()) {
             dashmap::Entry::Occupied(mut occupied) => match occupied.get() {
-                Entry::Queued => {
+                Entry::Queued { .. } => {
+                    let Entry::Queued { event } =
+                        std::mem::replace(occupied.get_mut(), Entry::Poisoned)
+                    else {
+                        unreachable!()
+                    };
                     occupied.insert(Entry::InProgress {
                         worker: self.id,
-                        event: Arc::new(Event::new()),
+                        event,
                     });
                 }
                 Entry::InProgress { .. } | Entry::Completed { .. } | Entry::Poisoned => {
