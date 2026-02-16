@@ -23,8 +23,8 @@ impl DeadlockDetector {
         }
     }
 
-    pub fn add_wait(&self, me: WorkerId, other: WorkerId) -> Result<(), ()> {
-        if me == other {
+    pub fn add_wait(&self, me: WorkerId, target: WorkerId) -> Result<(), ()> {
+        if me == target {
             return Err(());
         }
         let mut guard = self.state.lock().unwrap();
@@ -33,7 +33,7 @@ impl DeadlockDetector {
         state.not_visited.fill(true);
         let num_workers = state.num_workers();
 
-        state.todo.set(other.0, true);
+        state.todo.set(target.0, true);
 
         while let Some(current) = state.todo.first_one() {
             if current == me.0 {
@@ -53,14 +53,14 @@ impl DeadlockDetector {
             state.todo &= &state.not_visited;
         }
 
-        state.waits_for.set(me.0 * num_workers + other.0, true);
+        state.waits_for.set(me.0 * num_workers + target.0, true);
         Ok(())
     }
 
-    pub fn remove_wait(&self, me: WorkerId, other: WorkerId) {
+    pub fn remove_wait(&self, me: WorkerId, target: WorkerId) {
         let mut state = self.state.lock().unwrap();
         let num_workers = state.num_workers();
-        state.waits_for.set(me.0 * num_workers + other.0, false);
+        state.waits_for.set(me.0 * num_workers + target.0, false);
     }
 }
 
