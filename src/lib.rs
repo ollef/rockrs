@@ -56,10 +56,6 @@ struct Context<DB: Database> {
     query_dependencies: RefCell<Vec<DB::Query>>,
 }
 
-struct Stealable<Q> {
-    query: Q,
-}
-
 struct Theft<'a, DB: Database> {
     context: &'a Context<DB>,
 }
