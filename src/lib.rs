@@ -208,15 +208,6 @@ impl<DB: Database> Context<DB> {
         }
     }
 
-    fn rule<Q: Query<DB>>(&self, query: &Q) -> (Q::Result, Vec<DB::Query>) {
-        let saved_dependencies = self.query_dependencies.take();
-        let saved_current_query = self.current_query.replace(Some(query.clone().into()));
-        let result = Q::rule(self, query);
-        let query_dependencies = self.query_dependencies.replace(saved_dependencies);
-        self.current_query.replace(saved_current_query);
-        (result, query_dependencies)
-    }
-
     fn try_claim_and_execute<Q: Query<DB>, T>(
         &self,
         query: Q,
@@ -251,8 +242,16 @@ impl<DB: Database> Context<DB> {
             storage,
             query: Some(query.clone()),
         };
-        let (query_result, dependencies) =
-            stacker::maybe_grow(64 * 1024, 1024 * 1024, || self.rule(&query));
+
+        let (query_result, dependencies) = {
+            let saved_dependencies = self.query_dependencies.take();
+            let saved_current_query = self.current_query.replace(Some(query.clone().into()));
+            let query_result =
+                stacker::maybe_grow(64 * 1024, 1024 * 1024, || Q::rule(self, &query));
+            self.current_query.replace(saved_current_query);
+            let dependencies = self.query_dependencies.replace(saved_dependencies);
+            (query_result, dependencies)
+        };
         let result = f(&query_result);
         panic_guard.query = None;
         let mut reverse_dependencies = FxHashSet::default();
