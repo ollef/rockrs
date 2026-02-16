@@ -2,7 +2,7 @@ use crate::WorkerId;
 use bitvec::vec::BitVec;
 use std::sync::Mutex;
 
-pub struct DeadlockDetector {
+pub(crate) struct DeadlockDetector {
     state: Mutex<State>,
 }
 
